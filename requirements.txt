@@ -1,4 +1,4 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-voyageai==0.2.1
-pydantic==2.5.0
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+httpx==0.24.1
+pydantic==1.10.11
