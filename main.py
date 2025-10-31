@@ -1,23 +1,30 @@
 # main.py
 from typing import List, Optional, Dict, Any
 import os
+import logging
+import asyncio
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
+import uvicorn
 
-# Port is provided by Railway in $PORT
+# ----- Logging -----
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("voyage-reranker")
+
+# ----- App -----
 app = FastAPI(title="Voyage Reranker API")
 
+# ----- Config -----
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
 
 if not VOYAGE_API_KEY:
-    # In production, Railway will supply this env var. Keep app usable locally (with error).
-    print("Warning: VOYAGE_API_KEY not set. Set it in environment to call Voyage API.")
+    logger.warning("VOYAGE_API_KEY not set. Set it in environment to call Voyage API.")
 
-
+# ----- Models -----
 class Document(BaseModel):
-    # Accept full objects but default to a "content" field
     id: Optional[str] = None
     content: str
     metadata: Optional[Dict[str, Any]] = None
@@ -26,14 +33,22 @@ class Document(BaseModel):
 class RerankRequest(BaseModel):
     query: str
     documents: List[Document]
-    model: Optional[str] = None  # e.g., "rerank-2.5" or leave None for default
-    top_k: Optional[int] = None  # how many top results to return; None means return all
+    model: Optional[str] = None  # e.g., "rerank-2.5"
+    top_k: Optional[int] = None  # how many top results to return; None -> return all
+
+
+# ----- Endpoints -----
+@app.get("/")
+async def root():
+    """Health / root endpoint."""
+    return {"status": "voyage-reranker is up", "note": "POST /rerank with JSON body"}
 
 
 @app.post("/rerank")
 async def rerank(req: RerankRequest):
     """
-    Request body example:
+    POST /rerank
+    Body example:
     {
       "query": "What is the return policy?",
       "documents": [
@@ -47,63 +62,59 @@ async def rerank(req: RerankRequest):
     if not VOYAGE_API_KEY:
         raise HTTPException(status_code=500, detail="Voyage API key not configured on server.")
 
-    # Build payload expected by Voyage rerank endpoint:
-    # The docs expect: { "model": "...", "query": "...", "docs": [ { "content": "..." }, ... ], ... }
-    payload = {
+    # Build payload for Voyage rerank endpoint
+    payload: Dict[str, Any] = {
         "query": req.query,
         "docs": [{"id": d.id, "content": d.content, "metadata": d.metadata} for d in req.documents],
     }
     if req.model:
         payload["model"] = req.model
+    if req.top_k is not None:
+        payload["top_k"] = req.top_k
 
-    # Optional: send any additional instruction or argument if needed (Voyage supports extra args).
-    # Call Voyage AI endpoint
     headers = {
         "Authorization": f"Bearer {VOYAGE_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(VOYAGE_RERANK_URL, json=payload, headers=headers)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Error contacting Voyage API: {e}")
+    except httpx.RequestError as e:
+        logger.exception("Error contacting Voyage API")
+        raise HTTPException(status_code=502, detail=f"Error contacting Voyage API: {e}")
 
+    # Forward non-200 responses as 502/400 depending on status
     if resp.status_code != 200:
-        # Forward error message from Voyage if present
         try:
             err = resp.json()
         except Exception:
             err = resp.text
+        logger.error("Voyage API returned non-200: %s %s", resp.status_code, err)
         raise HTTPException(status_code=resp.status_code, detail={"voyage_error": err})
 
-    data = resp.json()
-    # Voyage returns ranking results — structure varies by model/version.
-    # We'll extract scores and indices if present, and assemble a stable output.
+    try:
+        data = resp.json()
+    except Exception:
+        logger.exception("Failed to parse Voyage response as JSON")
+        raise HTTPException(status_code=502, detail="Invalid JSON from Voyage API")
 
-    # Example expected: data might contain a list "scores" or "ranks" or "results" — include raw response.
-    # But most commonly it contains a list of doc scores in the response. We'll try to be generic:
-    output = {
-        "voyage_raw": data,
-        # Also build a convenience "ranked" list if data contains scores aligned with input docs:
-        "ranked": []
-    }
+    # Prepare convenient output
+    output: Dict[str, Any] = {"voyage_raw": data, "ranked": []}
 
-    # Best-effort: if Voyage returns `scores` as list of floats aligned with docs
+    # Heuristic parsing:
+    # 1) Check common keys that may contain rankings/scores.
     scores = None
     if isinstance(data, dict):
-        # Check common keys
         for k in ("scores", "scores_out", "results", "ranked"):
             if k in data and isinstance(data[k], list):
-                # If results list contains dicts with "score" and "index" or "id", use them:
                 candidate = data[k]
-                # If elements are numbers -> treat as scores
+                # if list of numbers -> numeric scores aligned with input docs
                 if all(isinstance(x, (int, float)) for x in candidate):
                     scores = candidate
                     break
-                # If elements are dicts and contain "score" and maybe "index" or "id"
+                # if list of dicts that include score/id/index -> map those
                 if all(isinstance(x, dict) for x in candidate):
-                    # try to map by index or id
                     results = []
                     for item in candidate:
                         s = item.get("score")
@@ -111,28 +122,44 @@ async def rerank(req: RerankRequest):
                         did = item.get("id")
                         results.append({"id": did, "index": idx, "score": s, "raw": item})
                     output["ranked"] = results
-                    # done
                     return output
 
-    # If we found numeric scores aligned with input documents:
+    # 2) If numeric scores found and length matches input docs, pair & sort
     if scores and len(scores) == len(req.documents):
         paired = []
         for doc, score in zip(req.documents, scores):
             paired.append({"id": doc.id, "content": doc.content, "score": score, "metadata": doc.metadata})
-        # Sort by descending score (higher = better)
         paired_sorted = sorted(paired, key=lambda x: x["score"] if x["score"] is not None else 0, reverse=True)
+        if req.top_k:
+            paired_sorted = paired_sorted[: req.top_k]
         output["ranked"] = paired_sorted
         return output
 
-    # Fallback: try to use "results" array containing items with "score" and "doc_index"
-    # If nothing matches, return raw response and original documents
+    # 3) If data contains a 'ranked' list with doc references, try to use it
+    if isinstance(data, dict) and "ranked" in data and isinstance(data["ranked"], list):
+        output["ranked"] = data["ranked"][: req.top_k] if req.top_k else data["ranked"]
+        return output
+
+    # 4) Fallback: return original docs (unscored) and raw response
     output["ranked"] = [
-        {"id": d.id, "content": d.content, "score": None, "metadata": d.metadata}
-        for d in req.documents
+        {"id": d.id, "content": d.content, "score": None, "metadata": d.metadata} for d in req.documents
     ]
     return output
 
 
-@app.get("/")
-async def root():
-    return {"status": "voyage-reranker is up", "note": "POST /rerank with JSON body"}
+# ----- Run server reading Railway PORT env var -----
+def _get_port() -> int:
+    raw = os.environ.get("PORT", "")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Invalid PORT value '%s', falling back to 8000", raw)
+    return 8000
+
+
+if __name__ == "__main__":
+    port = _get_port()
+    logger.info("Starting Uvicorn on 0.0.0.0:%d", port)
+    # Use uvicorn.run from Python so env-var port is respected on Railway
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
